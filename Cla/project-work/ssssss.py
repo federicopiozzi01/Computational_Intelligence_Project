@@ -7,15 +7,15 @@ import networkx as nx
 
 
 # =========================
-# Costanti GA 
+# Costanti GA
 # =========================
-POPULATION_SIZE = 100
-NUM_GENERATIONS = 1000
-MUTATION_RATE = 0.2
+POPULATION_SIZE = 160
+NUM_GENERATIONS = 500
+MUTATION_RATE = 0.15
 
 
 # =========================
-# Precompute distances
+# Precompute distances + paths
 # =========================
 def precompute_D_Db_and_paths(problem: Problem):
     """
@@ -56,12 +56,12 @@ def precompute_D_Db_and_paths(problem: Problem):
 
 
 # =========================
-# Cost function (coerente edge-by-edge con segment cost O(1))
+# Segment cost (coerente edge-by-edge, O(1) grazie a D/Db)
 # =========================
 def segment_cost_fast(problem: Problem, a: int, b: int, weight: float, D, Db) -> float:
     """
-    Costo coerente edge-by-edge sul cammino minimo a->b, ma calcolato in O(1):
-    sum(d_e) + (alpha*weight)^beta * sum(d_e^beta)
+    Costo coerente edge-by-edge sul cammino minimo a->b, calcolato in O(1):
+      sum(d_e) + (alpha*weight)^beta * sum(d_e^beta)
     """
     if a == b:
         return 0.0
@@ -72,8 +72,8 @@ def segment_cost_fast(problem: Problem, a: int, b: int, weight: float, D, Db) ->
 
 def getCoherentCost(problem: Problem, solution: list[int], D, Db) -> float:
     """
-    Fitness coerente con il problema (robusta per beta > 1),
-    mantenendo la tua scelta greedy "diretto vs via 0", ma con segment cost O(1).
+    Fitness coerente col problema (robusta per beta > 1) usando greedy:
+    ad ogni step decide se andare diretto o passare da 0 per scaricare.
     """
     cost = 0.0
     weight = 0.0
@@ -99,6 +99,7 @@ def getCoherentCost(problem: Problem, solution: list[int], D, Db) -> float:
     cost += segment_cost_fast(problem, current_node, 0, weight, D, Db)
     return cost
 
+
 # =========================
 # Popolazione iniziale
 # =========================
@@ -108,7 +109,7 @@ def init_population(problem: Problem, population_size: int) -> list[list[int]]:
     Ogni soluzione è una permutazione casuale delle città (escluso il deposito 0).
     """
     num_cities = len(problem._graph.nodes)
-    cities = list(range(1, num_cities))  # Escludo il deposito 0
+    cities = list(range(1, num_cities))  # escludo il deposito 0
 
     population = []
     for _ in range(population_size):
@@ -116,7 +117,6 @@ def init_population(problem: Problem, population_size: int) -> list[list[int]]:
         random.shuffle(individual)
         population.append(individual)
     return population
-
 
 
 # =========================
@@ -142,25 +142,19 @@ def tournament_selection(
     return best_candidate
 
 
-
 # =========================
 # Crossover OX
 # =========================
 def crossover(parent1: list[int], parent2: list[int]) -> list[int]:
     """
-    Applica l'operatore di crossover Order Crossover (OX) per generare un figlio
-    da due genitori.
+    Order Crossover (OX).
     """
     size = len(parent1)
-
-    # Scelgo due punti di taglio casuali
     start, end = sorted(random.sample(range(size), 2))
 
-    # Creo il figlio con None e copiamo la parte centrale da parent1
     child = [None] * size
-    child[start : end + 1] = parent1[start : end + 1]  # serve "+1" per includere end
+    child[start : end + 1] = parent1[start : end + 1]
 
-    # Riempio il resto del figlio con gli elementi di parent2 nell'ordine in cui appaiono
     p2_genes = [gene for gene in parent2 if gene not in child[start : end + 1]]
 
     current_p2_index = 0
@@ -176,8 +170,7 @@ def crossover(parent1: list[int], parent2: list[int]) -> list[int]:
 # =========================
 def tweak(solution: list[int]) -> list[int]:
     """
-    Applia un piccolo cambiamento (tweak) alla soluzione esistente
-    scambiando due città nella lista.
+    Swap di due città.
     """
     if len(solution) < 2:
         return solution.copy()
@@ -190,94 +183,200 @@ def tweak(solution: list[int]) -> list[int]:
 
 def mutation(individual: list[int], mutation_rate: float = 0.1) -> list[int]:
     """
-    Applica la mutazione alla soluzione scambiando due città con una certa probabilità.
+    Mutazione con probabilità mutation_rate (swap).
     """
     if random.random() < mutation_rate:
         return tweak(individual)
-    else:
-        return individual
+    return individual
 
 
 # =========================
-# Builder: costruisce path con (0,0) intermedi impliciti 
+# Builder output path (0 iniziale implicito, 0 intermedi e finale espliciti)
 # =========================
-def append_expanded_segment(out, path_nodes, pickup_at_end, include_start):
-    start_index = 0 if include_start else 1
-    if start_index >= len(path_nodes):
+def append_shortest_path_segment(
+    output_path: list[tuple[int, float]],
+    shortest_path: list[int],
+    *,
+    include_start_node: bool,
+    pickup_at_end: float,
+):
+    """
+    Appende un segmento di shortest path al path di output.
+
+    - Nodi intermedi: (node, 0.0)
+    - Nodo finale: (end, pickup_at_end)
+    - include_start_node=False: salta il primo nodo del segmento (evita duplicati)
+
+    Robustezza:
+    - evita duplicati consecutivi di nodo
+    - se lo stesso nodo appare due volte di fila con pickup diversi, li fonde (tiene il max pickup)
+    """
+    if not shortest_path:
         return
-    for node in path_nodes[start_index:-1]:
-        out.append((node, 0.0))
-    out.append((path_nodes[-1], float(pickup_at_end)))
+
+    start_idx = 0 if include_start_node else 1
+    if start_idx >= len(shortest_path):
+        return
+
+    # intermedi
+    for node in shortest_path[start_idx:-1]:
+        tup = (node, 0.0)
+        if not output_path:
+            output_path.append(tup)
+        else:
+            last_node, last_pick = output_path[-1]
+            if last_node == node:
+                output_path[-1] = (last_node, max(last_pick, 0.0))
+            else:
+                output_path.append(tup)
+
+    # destinazione
+    end_node = shortest_path[-1]
+    end_pick = float(pickup_at_end)
+
+    if not output_path:
+        output_path.append((end_node, end_pick))
+    else:
+        last_node, last_pick = output_path[-1]
+        if last_node == end_node:
+            output_path[-1] = (last_node, max(last_pick, end_pick))
+        else:
+            output_path.append((end_node, end_pick))
 
 
-def build_solution_with_depot_visits(problem, best_solution, D, Db, P):
-    out = []
+def build_output_path(problem: Problem, chromosome: list[int], D, Db, P):
+    """
+    Costruisce il path nel formato richiesto:
+
+    - (0,0) iniziale: IMPLICITO (non viene inserito)
+    - (0,0) intermedi: DEVONO esserci quando scarichi
+    - (0,0) finale: DEVE esserci
+    - Tutti i nodi attraversati nei shortest paths devono apparire
+      (pickup=0.0 se non raccogli oro lì)
+    """
+    if chromosome is None or len(chromosome) == 0:
+        return [(0, 0.0)]
+
+    out: list[tuple[int, float]] = []
     weight = 0.0
     current = 0
 
-    for nxt in best_solution:
+    for nxt in chromosome:
         direct = segment_cost_fast(problem, current, nxt, weight, D, Db)
-        via0 = (
+        via_0 = (
             segment_cost_fast(problem, current, 0, weight, D, Db)
             + segment_cost_fast(problem, 0, nxt, 0.0, D, Db)
         )
 
-        # if we decide to unload first
-        if via0 < direct:
+        if via_0 < direct:
+            # vai current -> 0 e inserisci (0,0)
             if current != 0:
-                path_to_0 = P[current][0]
-                append_expanded_segment(out, path_to_0, pickup_at_end=0.0, include_start=False)
+                append_shortest_path_segment(
+                    out,
+                    P[current][0],
+                    include_start_node=False,
+                    pickup_at_end=0.0,
+                )
+            else:
+                if not out or out[-1][0] != 0:
+                    out.append((0, 0.0))
+
             weight = 0.0
             current = 0
 
+        # vai current -> nxt (non stampare lo 0 iniziale implicito)
         gold = float(problem._graph.nodes[nxt].get("gold", 1))
-        path_to_next = P[current][nxt]
-
-        # avoid printing the initial depot (0) because it's implicit
         include_start = not (current == 0 and len(out) == 0)
-        append_expanded_segment(out, path_to_next, pickup_at_end=gold, include_start=include_start)
+
+        append_shortest_path_segment(
+            out,
+            P[current][nxt],
+            include_start_node=include_start,
+            pickup_at_end=gold,
+        )
 
         weight += gold
         current = nxt
 
-    # final return to depot (0,0) must be explicit
+    # ritorno finale a 0: deve comparire (0,0)
     if current != 0:
-        path_to_0 = P[current][0]
-        append_expanded_segment(out, path_to_0, pickup_at_end=0.0, include_start=False)
+        append_shortest_path_segment(
+            out,
+            P[current][0],
+            include_start_node=False,
+            pickup_at_end=0.0,
+        )
     else:
-        if len(out) == 0 or out[-1][0] != 0:
+        if not out or out[-1][0] != 0:
             out.append((0, 0.0))
 
-    if len(out) == 0 or out[-1][0] != 0:
-        out.append((0, 0.0))
+    if not out or out[-1] != (0, 0.0):
+        if not out or out[-1][0] != 0:
+            out.append((0, 0.0))
+        else:
+            out[-1] = (0, 0.0)
 
     return out
 
 
+# =========================
+# Cost of FINAL OUTPUT PATH (non dal cromosoma)
+# =========================
+def compute_output_path_cost(problem: Problem, path: list[tuple[int, float]], D, Db) -> float:
+    """
+    Calcola il costo del PATH finale prodotto (lista di tuple (city, pickup)).
+
+    Regole rispettate:
+    - lo start al deposito (0) è IMPLICITO per il path, ma per il calcolo partiamo da current=0
+    - quando arrivi a 0 il peso si resetta a 0 (scarico)
+    - il costo del movimento a->b usa segment_cost_fast con il peso corrente PRIMA di muoversi
+    - il gold raccolto viene aggiunto DOPO essere arrivati al nodo b (se b != 0)
+    """
+    if path is None or len(path) == 0:
+        return 0.0
+
+    total = 0.0
+    current = 0
+    weight = 0.0
+
+    for node, pickup in path:
+        node = int(node)
+
+        # costo spostamento current -> node con peso attuale
+        total += segment_cost_fast(problem, current, node, weight, D, Db)
+
+        # arrivo al nodo
+        if node == 0:
+            weight = 0.0  # scarico
+        else:
+            # nel tuo output i nodi intermedi hanno pickup=0.0
+            weight += float(pickup)
+
+        current = node
+
+    return total
 
 
 # =========================
-# Genetic Algorithm (integrata: ritorna già il path)
+# Genetic Algorithm
 # =========================
 def genetic_algorithm(
     problem: Problem,
     D,
     Db,
     P,
-    population_size: int = 50,
-    generations: int = 1000,
-    mutation_rate: float = 0.1,
+    population_size: int = 160,
+    generations: int = 500,
+    mutation_rate: float = 0.15,
 ):
-    # Inizializzo la popolazione
     population = init_population(problem, population_size)
 
     best_solution = None
     best_cost = float("inf")
 
-    for gen in range(generations):
+    for _ in range(generations):
         new_population = []
 
-        # --- ELITISMO ---
         population.sort(key=lambda x: getCoherentCost(problem, x, D, Db))
         best_of_gen = population[0]
         cost_of_gen = getCoherentCost(problem, best_of_gen, D, Db)
@@ -287,44 +386,35 @@ def genetic_algorithm(
             best_solution = best_of_gen.copy()
 
         new_population.append(best_of_gen)
-        # -----------------
 
-        # Riempiamo il resto della nuova popolazione (population_size - 1)
         while len(new_population) < population_size:
-            # Parent Selection
             parent1 = tournament_selection(problem, population, D, Db)
             parent2 = tournament_selection(problem, population, D, Db)
 
-            # Crossover
             child = crossover(parent1, parent2)
-
-            # Mutation
             child = mutation(child, mutation_rate)
 
             new_population.append(child)
 
-        # Sostituiamo la vecchia popolazione con la nuova
         population = new_population
 
-    # ===== INTEGRAZIONE: costruisco il path finale nel formato richiesto =====
-    final_path = build_solution_with_depot_visits(problem, best_solution, D, Db, P)
-    return final_path, best_cost
+    final_path = build_output_path(problem, best_solution, D, Db, P)
+    return final_path
 
 
 # =========================
-# Entry point richiesto dal progetto
+# Entry point richiesto dal progetto (qui: restituisco solo path)
 # =========================
 def solution(p: Problem):
     """
     Deve ritornare un path nel formato:
-    [(c1,g1), (c2,g2), ..., (cN,gN), (0,0)]
-    (qui possono apparire anche (0,0) intermedi)
+    [(c1,g1), (c2,g2), ..., (0,0)]
+    - 0 iniziale implicito
+    - 0 intermedi espliciti quando scarichi
+    - 0 finale esplicito
     """
     D, Db, P = precompute_D_Db_and_paths(p)
-
-    # Se vuoi misurare il tempo puoi farlo qui, ma non è necessario per il grader
-    
-    sol_ga, cost_ga = genetic_algorithm(
+    sol_path = genetic_algorithm(
         p,
         D=D,
         Db=Db,
@@ -333,43 +423,113 @@ def solution(p: Problem):
         generations=NUM_GENERATIONS,
         mutation_rate=MUTATION_RATE,
     )
-    
-    return sol_ga
+    return sol_path
 
 # =========================
-# Valutazione del path prodotto da richiamare localmente
+# Verifiche sul path generato
 
-def evaluate_output_path(problem, path_out, D, Db):
-    nodes_seq = [0] + [c for c, _ in path_out]
-    pickups = [0.0] + [float(g) for _, g in path_out]
+def check_all_cities_visited(problem: Problem, output_path: list[tuple[int, float]]):
+    visited = set(c for c, _ in output_path)
+    missing = [i for i in problem._graph.nodes if i != 0 and i not in visited]
+    if not missing:
+        print("✅ Visit check OK: tutte le città compaiono almeno una volta nel path.")
+        return True
+    print("❌ ERRORE: queste città non compaiono nel path:", missing)
+    return False
 
-    weight = 0.0
+
+def check_pickups(problem: Problem, output_path: list[tuple[int, float]], tol: float = 1e-6):
+    """
+    Verifica che:
+    - non raccogli oro al deposito 0
+    - per ogni città i>0, la somma dei pickup nel path sia esattamente problem._graph.nodes[i]['gold']
+      (entro tolleranza)
+    """
+    gold_true = {i: float(problem._graph.nodes[i]["gold"]) for i in problem._graph.nodes if i != 0}
+    picked = {i: 0.0 for i in gold_true}
+
+    bad_depot = []
+    for (c, g) in output_path:
+        g = float(g)
+        if c == 0:
+            if abs(g) > tol:
+                bad_depot.append((c, g))
+            continue
+        picked[c] += g
+
+    # report
+    duplicates = [(i, picked[i], gold_true[i]) for i in picked if picked[i] > gold_true[i] + tol]
+    missing    = [(i, picked[i], gold_true[i]) for i in picked if picked[i] < gold_true[i] - tol]
+
+    ok = (len(bad_depot) == 0 and len(duplicates) == 0 and len(missing) == 0)
+
+    if ok:
+        print("✅ Pickup check OK: ogni città raccolta esattamente una volta (entro tolleranza).")
+        return True
+
+    if bad_depot:
+        print("❌ ERRORE: hai pickup != 0 sul deposito 0:", bad_depot[:10], ("..." if len(bad_depot) > 10 else ""))
+
+    if duplicates:
+        print("❌ ERRORE: stai raccogliendo TROPPO oro (double pickup) in queste città:")
+        for i, got, true in duplicates[:20]:
+            print(f"  city {i}: picked={got:.6f}  true={true:.6f}")
+        if len(duplicates) > 20:
+            print("  ...")
+
+    if missing:
+        print("❌ ERRORE: non stai raccogliendo abbastanza oro (manca pickup) in queste città:")
+        for i, got, true in missing[:20]:
+            print(f"  city {i}: picked={got:.6f}  true={true:.6f}")
+        if len(missing) > 20:
+            print("  ...")
+
+    return False
+def compute_cost_using_problem_cost(problem: Problem, output_path: list[tuple[int, float]]):
+    """
+    Calcola il costo seguendo ESATTAMENTE Problem.cost([a,b], weight)
+    ricostruendo il peso trasportato passo-passo dal path di output.
+
+    Assunzione: output_path contiene anche i nodi intermedi (quindi ogni salto è un edge del grafo).
+    """
     total = 0.0
+    weight = 0.0
+    current = 0
 
-    for i, (a, b) in enumerate(zip(nodes_seq, nodes_seq[1:])):
-        total += segment_cost_fast(problem, a, b, weight, D, Db)
+    for nxt, pickup in output_path:
+        # costo dell'arco current->nxt con peso corrente
+        total += problem.cost([current, nxt], weight)
 
-        if b == 0:
+        # aggiorna peso/pickup
+        if nxt == 0:
             weight = 0.0
         else:
-            weight += pickups[i + 1]  # pickup declared in the output path
+            weight += float(pickup)
+
+        current = nxt
 
     return total
+def check_edges_exist(problem: Problem, output_path: list[tuple[int, float]]):
+    g = problem._graph
+    current = 0
+    for nxt, _ in output_path:
+        if not g.has_edge(current, nxt):
+            print(f"❌ Missing edge: {current} -> {nxt}")
+            return False
+        current = nxt
+    print("✅ Edge check OK: ogni step è un arco del grafo.")
+    return True
 
 
 
+# =========================
+# Run local
+# =========================
 def run_local():
-    """
-    Funzione di test locale:
-    - crea il problema
-    - esegue la solution()
-    - stampa path e costo
-    """
-    # Parametri di esempio (puoi cambiarli)
     NUM_CITIES = 100
     DENSITY = 0.2
-    ALPHA = 1.0
-    BETA = 1.0
+    ALPHA = 2.0
+    BETA = 3.0
     SEED = 42
 
     print("=== Creazione problema ===")
@@ -381,31 +541,37 @@ def run_local():
         seed=SEED,
     )
 
-    print("=== Precompute distances ===")
+    print("=== Precompute D/Db/P ===")
     D, Db, P = precompute_D_Db_and_paths(p)
 
     print("=== Esecuzione GA ===")
     start = time.time()
     sol = solution(p)
     ga_time = time.time() - start
-    
 
     print("\n=== SOLUZIONE GA ===")
     print("Path:")
     for c, g in sol:
         print(f"({c}, {g:.2f})")
 
+    # costo calcolato dal PATH finale (non dal cromosoma)
+    cost = compute_output_path_cost(p, sol, D, Db)
+    check_all_cities_visited(p, sol)
 
-    cost = evaluate_output_path(p, sol, D, Db)
-    # 2) Baseline
+    check_pickups(p, sol)
+    cost_official = compute_cost_using_problem_cost(p, sol)
+    print("Costo (Problem.cost edge-by-edge):", round(cost_official, 2))
+    check_edges_exist(p, sol)
+    # Baseline
     t0 = time.time()
     baseline_cost = p.baseline()
     baseline_time = time.time() - t0
     improvement = (baseline_cost - cost) / baseline_cost * 100.0 if baseline_cost != 0 else 0.0
+    print("\n valori inizili: num{}, density={}, alpha={}, beta={}, seed={}".format(NUM_CITIES, DENSITY, ALPHA, BETA, SEED))
+    print("\nCosto totale GA (dal PATH finale): {:.2f} (in {:.2f} seconds)".format(cost, ga_time))
+    print("Costo baseline: {:.2f} (in {:.2f} seconds)".format(baseline_cost, baseline_time))
+    print("Improvement (GA - Baseline): {:.2f}%".format(improvement))
 
-    print("\nCosto totale GA (evaluate_output_path): {:.2f} (in {:.2f} seconds)".format(cost, ga_time))
-    print("\nCosto baseline: {:.2f} (in {:.2f} seconds)".format(baseline_cost, baseline_time))
-    print("\n Improvement (GA - Baseline): {:.2f}%".format(improvement))
 
 if __name__ == "__main__":
     run_local()
