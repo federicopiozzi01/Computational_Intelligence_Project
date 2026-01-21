@@ -17,14 +17,12 @@ MUTATION_RATE = 0.2
 # =========================
 # Precompute distances
 # =========================
-def precompute_D_and_Db(problem: Problem):
+def precompute_D_Db_and_paths(problem: Problem):
     """
-    Precompute per ogni coppia (i,j):
-    - D[i][j]  = somma delle distanze degli archi sul cammino minimo i->j
-    - Db[i][j] = somma (dist_edge ** beta) degli archi sul cammino minimo i->j
-
-    Così il costo coerente edge-by-edge diventa O(1):
-    segment_cost(i,j,w) = D[i][j] + (alpha*w)^beta * Db[i][j]
+    Precompute:
+      - D[i][j]  = shortest-path distance (sum of edge dist) from i to j
+      - Db[i][j] = sum(dist_edge ** beta) along the same shortest path
+      - P[i][j]  = list of nodes on the shortest path i -> j (inclusive)
     """
     g = problem._graph
     n = len(g.nodes)
@@ -32,27 +30,30 @@ def precompute_D_and_Db(problem: Problem):
 
     D = np.full((n, n), np.inf, dtype=float)
     Db = np.zeros((n, n), dtype=float)
-    # Distance from a node to itself is always 0
+
+    # P[i][j] is a list of nodes (path) or None
+    P: list[list[list[int] | None]] = [[None for _ in range(n)] for _ in range(n)]
+
     for i in range(n):
         D[i][i] = 0.0
         Db[i][i] = 0.0
+        P[i][i] = [i]
 
-    # per ogni sorgente calcolo distanze e path minimi
     for src in range(n):
-        # path_dict[tgt] is the list of nodes on the shortest path src -> tgt
         dist_dict, path_dict = nx.single_source_dijkstra(g, src, weight="dist")
+
         for tgt, path in path_dict.items():
-            # sommo gli archi del path
-            d_sum = 0.0
+            D[src][tgt] = float(dist_dict[tgt])
+            P[src][tgt] = path
+
             db_sum = 0.0
             for u, v in zip(path, path[1:]):
                 d = g[u][v]["dist"]
-                d_sum += d
                 db_sum += d ** beta
-            D[src][tgt] = d_sum
             Db[src][tgt] = db_sum
 
-    return D, Db
+    return D, Db, P
+
 
 # =========================
 # Cost function (coerente edge-by-edge con segment cost O(1))
@@ -198,40 +199,60 @@ def mutation(individual: list[int], mutation_rate: float = 0.1) -> list[int]:
 
 
 # =========================
-# Builder: costruisce path con (0,0) intermedi
+# Builder: costruisce path con (0,0) intermedi impliciti 
 # =========================
-def build_solution_with_depot_visits(
-    problem: Problem,
-    best_solution: list[int],
-    D,
-    Db,
-) -> list[tuple[int, float]]:
-    path_out: list[tuple[int, float]] = []
-    weight = 0.0
-    current_node = 0
+def append_expanded_segment(out, path_nodes, pickup_at_end, include_start):
+    start_index = 0 if include_start else 1
+    if start_index >= len(path_nodes):
+        return
+    for node in path_nodes[start_index:-1]:
+        out.append((node, 0.0))
+    out.append((path_nodes[-1], float(pickup_at_end)))
 
-    for next_node in best_solution:
-        cost_direct = segment_cost_fast(problem, current_node, next_node, weight, D, Db)
-        cost_via_0 = (
-            segment_cost_fast(problem, current_node, 0, weight, D, Db)
-            + segment_cost_fast(problem, 0, next_node, 0.0, D, Db)
+
+def build_solution_with_depot_visits(problem, best_solution, D, Db, P):
+    out = []
+    weight = 0.0
+    current = 0
+
+    for nxt in best_solution:
+        direct = segment_cost_fast(problem, current, nxt, weight, D, Db)
+        via0 = (
+            segment_cost_fast(problem, current, 0, weight, D, Db)
+            + segment_cost_fast(problem, 0, nxt, 0.0, D, Db)
         )
 
-        if cost_via_0 < cost_direct:
-            if current_node != 0:
-                path_out.append((0, 0))
+        # if we decide to unload first
+        if via0 < direct:
+            if current != 0:
+                path_to_0 = P[current][0]
+                append_expanded_segment(out, path_to_0, pickup_at_end=0.0, include_start=False)
             weight = 0.0
-            current_node = 0
+            current = 0
 
-        gold_here = problem._graph.nodes[next_node].get("gold", 1)
-        path_out.append((next_node, gold_here))
-        weight += gold_here
-        current_node = next_node
+        gold = float(problem._graph.nodes[nxt].get("gold", 1))
+        path_to_next = P[current][nxt]
 
-    if len(path_out) == 0 or path_out[-1] != (0, 0):
-        path_out.append((0, 0))
+        # avoid printing the initial depot (0) because it's implicit
+        include_start = not (current == 0 and len(out) == 0)
+        append_expanded_segment(out, path_to_next, pickup_at_end=gold, include_start=include_start)
 
-    return path_out
+        weight += gold
+        current = nxt
+
+    # final return to depot (0,0) must be explicit
+    if current != 0:
+        path_to_0 = P[current][0]
+        append_expanded_segment(out, path_to_0, pickup_at_end=0.0, include_start=False)
+    else:
+        if len(out) == 0 or out[-1][0] != 0:
+            out.append((0, 0.0))
+
+    if len(out) == 0 or out[-1][0] != 0:
+        out.append((0, 0.0))
+
+    return out
+
 
 
 
@@ -242,6 +263,7 @@ def genetic_algorithm(
     problem: Problem,
     D,
     Db,
+    P,
     population_size: int = 50,
     generations: int = 1000,
     mutation_rate: float = 0.1,
@@ -285,7 +307,7 @@ def genetic_algorithm(
         population = new_population
 
     # ===== INTEGRAZIONE: costruisco il path finale nel formato richiesto =====
-    final_path = build_solution_with_depot_visits(problem, best_solution, D, Db)
+    final_path = build_solution_with_depot_visits(problem, best_solution, D, Db, P)
     return final_path, best_cost
 
 
@@ -298,7 +320,7 @@ def solution(p: Problem):
     [(c1,g1), (c2,g2), ..., (cN,gN), (0,0)]
     (qui possono apparire anche (0,0) intermedi)
     """
-    D, Db = precompute_D_and_Db(p)
+    D, Db, P = precompute_D_Db_and_paths(p)
 
     # Se vuoi misurare il tempo puoi farlo qui, ma non è necessario per il grader
     
@@ -306,6 +328,7 @@ def solution(p: Problem):
         p,
         D=D,
         Db=Db,
+        P=P,
         population_size=POPULATION_SIZE,
         generations=NUM_GENERATIONS,
         mutation_rate=MUTATION_RATE,
@@ -316,20 +339,23 @@ def solution(p: Problem):
 # =========================
 # Valutazione del path prodotto da richiamare localmente
 
-def evaluate_output_path(problem: Problem, path_out: list[tuple[int, float]], D, Db) -> float:
+def evaluate_output_path(problem, path_out, D, Db):
     nodes_seq = [0] + [c for c, _ in path_out]
+    pickups = [0.0] + [float(g) for _, g in path_out]
+
     weight = 0.0
     total = 0.0
 
-    for a, b in zip(nodes_seq, nodes_seq[1:]):
+    for i, (a, b) in enumerate(zip(nodes_seq, nodes_seq[1:])):
         total += segment_cost_fast(problem, a, b, weight, D, Db)
 
         if b == 0:
             weight = 0.0
         else:
-            weight += problem._graph.nodes[b].get("gold", 1)
+            weight += pickups[i + 1]  # pickup declared in the output path
 
     return total
+
 
 
 def run_local():
@@ -356,7 +382,7 @@ def run_local():
     )
 
     print("=== Precompute distances ===")
-    D, Db = precompute_D_and_Db(p)
+    D, Db, P = precompute_D_Db_and_paths(p)
 
     print("=== Esecuzione GA ===")
     start = time.time()
